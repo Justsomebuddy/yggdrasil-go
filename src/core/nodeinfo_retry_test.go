@@ -14,9 +14,10 @@ import (
 
 // Count only fixed NodeInfo events; never retain keys or payloads from logs.
 type nodeInfoTestLog struct {
-	mu     sync.Mutex
-	writes int
-	failed int
+	mu       sync.Mutex
+	writes   int
+	failed   int
+	readDone <-chan struct{}
 }
 
 func (l *nodeInfoTestLog) Write(p []byte) (int, error) {
@@ -44,7 +45,8 @@ func nodeInfoRetryFixture(t *testing.T) (*Core, *nodeInfoTestLog, func()) {
 	stats := new(nodeInfoTestLog)
 	logger := log.New(stats, "", 0)
 	logger.EnableLevel("debug")
-	c, stop := newNodeInfoCore(t, logger)
+	c, stop, readDone := newNodeInfoCore(t, logger)
+	stats.readDone = readDone
 	return c, stats, stop
 }
 
@@ -212,10 +214,19 @@ func TestNodeInfoFailedWriteIsBounded(t *testing.T) {
 	t.Log("NodeInfo failed write: entry")
 	defer t.Log("NodeInfo failed write: exit")
 	c, stats, _ := nodeInfoRetryFixture(t)
-	if err := c.PacketConn.Close(); err != nil {
+	if err := c.Close(); err != nil {
 		t.Fatal("packet connection close failed")
 	}
+	// Ironwood's encrypted writer observes closure through its reader loop.
+	// Wait for that loop instead of racing the first write against shutdown.
+	select {
+	case <-stats.readDone:
+	case <-time.After(time.Second):
+		t.Fatal("closed connection reader did not stop")
+	}
 	_, err := c.proto.nodeinfo.requestNodeInfo(keyArray{6}, 100*time.Millisecond, 30*time.Millisecond)
+	// The request deadline does not wait for an already running actor write.
+	phony.Block(&c.proto.nodeinfo, func() {})
 	writes, failed := stats.counts()
 	if err == nil || writes < 1 || writes > 4 || failed != writes {
 		t.Fatalf("failed writes=%d/%d, timeout=%t", failed, writes, err != nil)

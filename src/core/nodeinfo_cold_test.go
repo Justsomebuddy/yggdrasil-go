@@ -19,7 +19,7 @@ import (
 	"github.com/Arceliar/phony"
 )
 
-func newNodeInfoCore(t *testing.T, logger Logger) (*Core, func()) {
+func newNodeInfoCore(t *testing.T, logger Logger) (*Core, func(), <-chan struct{}) {
 	t.Helper()
 	t.Log("NodeInfo fixture: entry")
 	defer t.Log("NodeInfo fixture: exit")
@@ -67,7 +67,7 @@ func newNodeInfoCore(t *testing.T, logger Logger) (*Core, func()) {
 		})
 	}
 	t.Cleanup(stop)
-	return c, stop
+	return c, stop, readDone
 }
 
 func waitNodeInfoPending(t *testing.T, c *Core) {
@@ -91,8 +91,8 @@ func waitNodeInfoPending(t *testing.T, c *Core) {
 func TestNodeInfoColdStart(t *testing.T) {
 	t.Log("NodeInfo cold start: entry")
 	defer t.Log("NodeInfo cold start: exit")
-	a, _ := newNodeInfoCore(t, nil)
-	b, _ := newNodeInfoCore(t, nil)
+	a, _, _ := newNodeInfoCore(t, nil)
+	b, _, _ := newNodeInfoCore(t, nil)
 	input, err := json.Marshal(GetNodeInfoRequest{Key: hex.EncodeToString(b.PublicKey())})
 	if err != nil {
 		t.Fatal("request encoding failed")
@@ -152,7 +152,7 @@ func TestNodeInfoColdStart(t *testing.T) {
 func TestNodeInfoUnreachableBudget(t *testing.T) {
 	t.Log("NodeInfo unreachable budget: entry")
 	defer t.Log("NodeInfo unreachable budget: exit")
-	c, _ := newNodeInfoCore(t, nil)
+	c, _, _ := newNodeInfoCore(t, nil)
 	var dest keyArray
 	dest[0] = c.PublicKey()[0] ^ 1
 	var lookups atomic.Int32
