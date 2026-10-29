@@ -74,6 +74,15 @@ by giving the Yggdrasil binary the `CAP_NET_ADMIN` capability.
 
 ## Documentation
 
+### Remote NodeInfo requests
+
+The admin `getNodeInfo` request retries unanswered remote queries at two-second
+intervals within its existing six-second timeout (at most three attempts).
+This allows an initial query to recover while the routing tree and Bloom filters
+converge. Attempts stop after a response, timeout or node shutdown; local queries
+do not retry. The timeout is not extended, and this does not change routing or
+provide reliable delivery for other application traffic.
+
 Documentation is available [on our website](https://yggdrasil-network.github.io).
 
 - [Installing Yggdrasil](https://yggdrasil-network.github.io/installation.html)
