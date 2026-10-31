@@ -1,0 +1,607 @@
+From 3ea3608cf18c665ae5731ae710b2f371d6f370e7 Mon Sep 17 00:00:00 2001
+From: Justsomebuddy <justsomebuddy@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 12:47:15 +0300
+Subject: [PATCH] fix(network): retry unresolved explicit lookups after
+ convergence
+
+Use the existing router maintenance cycle for at most two retries per locally admitted explicit lookup. Preserve throttle, expiry, signed-notification validation, best-effort buffering and wire/crypto behavior. Add fresh-peer public API regression and bounded lifecycle controls.
+---
+ README.md                    |   8 ++
+ network/lookup_cold_test.go  |  82 +++++++++++
+ network/lookup_retry.go      |  64 +++++++++
+ network/lookup_retry_test.go | 260 +++++++++++++++++++++++++++++++++++
+ network/packetconn.go        |   6 +-
+ network/pathfinder.go        |  22 ++-
+ network/router.go            |   6 +
+ 7 files changed, 444 insertions(+), 4 deletions(-)
+ create mode 100644 network/lookup_cold_test.go
+ create mode 100644 network/lookup_retry.go
+ create mode 100644 network/lookup_retry_test.go
+
+diff --git a/README.md b/README.md
+index 6c8651b..672b1e3 100644
+--- a/README.md
++++ b/README.md
+@@ -16,6 +16,14 @@ The `types` package exposes a `types.PacketConn` interface type. This is a super
+ 
+ The `network` package implements all of the important routing logic. Packets sent over the `network.PacketConn` are unencrypted, unsigned, and otherwise at least as insecure as UDP. The main use case for this package is to wrap it with a more secure protocol (e.g. DTLS, QUIC, or TLS-over-μTP).
+ 
++A local `SendLookup` can precede fresh-peer routing convergence. Explicit
++lookups receive at most two automatic retries from the existing maintenance
++cycle, respecting the configured path throttle (with a one-second floor).
++Retries neither extend the rumor lifetime nor allocate another timer or packet
++buffer, and an accepted signed path notification cancels them. The caller's
++original buffering and best-effort delivery semantics remain unchanged; this
++is not a guarantee that every initial datagram is delivered.
++
+ Internally, protocol traffic is signed (when necessary for authentication), but never encrypted, so this should be legal in environments where encryption is not permissible (e.g. amateur radio networks).
+ 
+ ### Signed
+diff --git a/network/lookup_cold_test.go b/network/lookup_cold_test.go
+new file mode 100644
+index 0000000..dd998ec
+--- /dev/null
++++ b/network/lookup_cold_test.go
+@@ -0,0 +1,82 @@
++package network
++
++import (
++	"bytes"
++	"crypto/ed25519"
++	"testing"
++	"time"
++)
++
++// Regression through public SendLookup and real signed path notifications.
++// No application data/write/retry, warmup, TUN, root, socket or WAN. Peering
++// uses the repository's existing in-memory reliable ordered connection fixture.
++func TestExplicitLookupFreshPeer(t *testing.T) {
++	t.Log("[1/3] entry TestExplicitLookupFreshPeer processed=0/3 remaining=3")
++	started := time.Now()
++	defer func() {
++		t.Logf("[3/3] final processed=3/3 errors=testing elapsed=%s speed=%.2fstages/s", time.Since(started), 3/time.Since(started).Seconds())
++	}()
++	pubA, privA, err := ed25519.GenerateKey(nil)
++	if err != nil {
++		t.Fatal("first fixture key generation failed")
++	}
++	pubB, privB, err := ed25519.GenerateKey(nil)
++	if err != nil {
++		t.Fatal("second fixture key generation failed")
++	}
++	ready := make(chan struct{}, 1)
++	a, err := NewPacketConn(privA, WithPathNotify(func(key ed25519.PublicKey) {
++		if bytes.Equal(key, pubB) {
++			select {
++			case ready <- struct{}{}:
++			default:
++			}
++		}
++	}))
++	if err != nil {
++		t.Fatal("first packet connection failed")
++	}
++	b, err := NewPacketConn(privB)
++	if err != nil {
++		_ = a.Close()
++		t.Fatal("second packet connection failed")
++	}
++	ca, cb := newDummyConn(pubA, pubB)
++	joined := make(chan struct{}, 2)
++	go func() { _ = a.HandleConn(pubB, ca, 0); joined <- struct{}{} }()
++	go func() { _ = b.HandleConn(pubA, cb, 0); joined <- struct{}{} }()
++	t.Cleanup(func() {
++		t.Log("state TestExplicitLookupFreshPeer cleanup")
++		_ = ca.Close()
++		_ = cb.Close()
++		_ = a.Close()
++		_ = b.Close()
++		for i := 0; i < 2; i++ {
++			select {
++			case <-joined:
++			case <-time.After(time.Second):
++				t.Error("owned peer failed to join")
++			}
++		}
++	})
++	deadline := time.Now().Add(3 * time.Second)
++	for len(a.Debug.GetTree()) < 2 || len(b.Debug.GetTree()) < 2 {
++		if time.Now().After(deadline) {
++			t.Fatal("fresh peer/tree readiness failed")
++		}
++		time.Sleep(5 * time.Millisecond)
++	}
++	if len(a.Debug.GetPaths()) != 0 {
++		t.Fatal("path unexpectedly warmed")
++	}
++	t.Logf("[2/3] one public SendLookup processed=1/3 remaining=2 elapsed=%s ETA<=6s", time.Since(started))
++	a.SendLookup(pubB)
++	select {
++	case <-ready:
++		if len(a.Debug.GetPaths()) != 1 {
++			t.Fatal("notify arrived without resolved path")
++		}
++	case <-time.After(6 * time.Second):
++		t.Fatal("single cold explicit lookup never retried after fresh peer convergence")
++	}
++}
+diff --git a/network/lookup_retry.go b/network/lookup_retry.go
+new file mode 100644
+index 0000000..f6e8ecf
+--- /dev/null
++++ b/network/lookup_retry.go
+@@ -0,0 +1,64 @@
++package network
++
++import (
++	"log/slog"
++	"time"
++)
++
++const explicitLookupRetries = 2
++
++// Actor ownership, existing rumor admission/TTL and existing maintenance timer
++// bound this retry. Remote traffic never creates explicit pending state. No
++// additional timer, packet buffer, map entry, wire field or crypto change.
++func (pf *pathfinder) _startExplicitLookup(dest publicKey) {
++	slog.Debug("entry pathfinder _startExplicitLookup")
++	defer slog.Debug("exit pathfinder _startExplicitLookup")
++	slog.Debug("external initial explicit lookup through existing rumor admission")
++	pf._rumorSendLookup(dest)
++	xform := pf.router.blooms.xKey(dest)
++	rumor, ok := pf.rumors[xform]
++	if !ok {
++		slog.Error("explicit lookup state missing")
++		return
++	}
++	if rumor.lookupStarted {
++		slog.Debug("result explicit lookup already admitted")
++		return
++	}
++	rumor.lookupTarget = dest
++	rumor.lookupStarted, rumor.lookupPending = true, true
++	pf.rumors[xform] = rumor
++	slog.Debug("state explicit lookup pending")
++}
++
++func (pf *pathfinder) _retryExplicitLookups() {
++	slog.Debug("entry pathfinder _retryExplicitLookups")
++	defer slog.Debug("exit pathfinder _retryExplicitLookups")
++	for xform, rumor := range pf.rumors {
++		if !rumor.lookupPending || rumor.lookupRetries >= explicitLookupRetries {
++			continue
++		}
++		if time.Since(rumor.sendTime) < max(time.Second, pf.router.core.config.pathThrottle) {
++			continue
++		}
++		// Deliberately do NOT reset rumor.timer or admit a new rumor. The
++		// finite retry budget belongs to this existing rumor, not each write.
++		rumor.lookupRetries++
++		rumor.sendTime = time.Now()
++		pf.rumors[xform] = rumor
++		slog.Debug("state explicit lookup retry", "attempt", rumor.lookupRetries)
++		slog.Debug("external resend explicit path lookup")
++		pf._sendLookup(rumor.lookupTarget)
++	}
++}
++
++func (pf *pathfinder) _finishExplicitLookup(dest publicKey) {
++	slog.Debug("entry pathfinder _finishExplicitLookup")
++	defer slog.Debug("exit pathfinder _finishExplicitLookup")
++	xform := pf.router.blooms.xKey(dest)
++	if rumor, ok := pf.rumors[xform]; ok && rumor.lookupPending {
++		rumor.lookupPending = false
++		pf.rumors[xform] = rumor
++		slog.Debug("state explicit lookup resolved")
++	}
++}
+diff --git a/network/lookup_retry_test.go b/network/lookup_retry_test.go
+new file mode 100644
+index 0000000..92f10c0
+--- /dev/null
++++ b/network/lookup_retry_test.go
+@@ -0,0 +1,260 @@
++package network
++
++import (
++	"crypto/ed25519"
++	"testing"
++	"time"
++
++	"github.com/Arceliar/phony"
++)
++
++func explicitFixture(t *testing.T, opts ...Option) (*PacketConn, map[publicKey]int) {
++	t.Helper()
++	t.Log("entry explicitFixture")
++	defer t.Log("exit explicitFixture")
++	_, key, err := ed25519.GenerateKey(nil)
++	if err != nil {
++		t.Fatal("fixture generation failed")
++	}
++	pc, err := NewPacketConn(key, opts...)
++	if err != nil {
++		t.Fatal("fixture construction failed")
++	}
++	counts := map[publicKey]int{}
++	phony.Block(&pc.core.router, func() {
++		pc.core.router.mainTimer.Stop()
++		pc.core.router.pathfinder.logger = func(lookup *pathLookup) { counts[lookup.dest]++ }
++	})
++	t.Cleanup(func() {
++		t.Log("state explicitFixture cleanup")
++		phony.Block(&pc.core.router, func() {
++			for key, info := range pc.core.router.pathfinder.paths {
++				info.timer.Stop()
++				if info.traffic != nil {
++					freeTraffic(info.traffic)
++				}
++				delete(pc.core.router.pathfinder.paths, key)
++			}
++			for key, rumor := range pc.core.router.pathfinder.rumors {
++				rumor.timer.Stop()
++				if rumor.traffic != nil {
++					freeTraffic(rumor.traffic)
++				}
++				delete(pc.core.router.pathfinder.rumors, key)
++			}
++		})
++		if err := pc.Close(); err != nil && !pc.IsClosed() {
++			t.Error("fixture close failed")
++		}
++	})
++	return pc, counts
++}
++
++func TestExplicitLookupFiniteBudget(t *testing.T) {
++	t.Log("entry TestExplicitLookupFiniteBudget")
++	defer t.Log("exit TestExplicitLookupFiniteBudget")
++	pc, counts := explicitFixture(t)
++	var dest publicKey
++	dest[0] = 1
++	var got [5]int
++	phony.Block(&pc.core.router, func() {
++		pf := &pc.core.router.pathfinder
++		pf._startExplicitLookup(dest)
++		got[0] = counts[dest]
++		for i := 1; i < len(got); i++ {
++			xform := pf.router.blooms.xKey(dest)
++			rumor := pf.rumors[xform]
++			rumor.sendTime = time.Now().Add(-2 * time.Second)
++			pf.rumors[xform] = rumor
++			pf._retryExplicitLookups()
++			got[i] = counts[dest]
++		}
++	})
++	if got != [5]int{1, 2, 3, 3, 3} {
++		t.Fatalf("lookup counts=%v", got)
++	}
++}
++
++func TestExplicitLookupNoBudgetResetByNewWrite(t *testing.T) {
++	t.Log("entry TestExplicitLookupNoBudgetResetByNewWrite")
++	defer t.Log("exit TestExplicitLookupNoBudgetResetByNewWrite")
++	pc, counts := explicitFixture(t)
++	var dest publicKey
++	dest[0] = 2
++	var automatic uint8
++	var got int
++	phony.Block(&pc.core.router, func() {
++		pf := &pc.core.router.pathfinder
++		pf._startExplicitLookup(dest)
++		for i := 0; i < 2; i++ {
++			r := pf.rumors[dest]
++			r.sendTime = time.Now().Add(-2 * time.Second)
++			pf.rumors[dest] = r
++			pf._retryExplicitLookups()
++		}
++		r := pf.rumors[dest]
++		r.sendTime = time.Now().Add(-2 * time.Second)
++		pf.rumors[dest] = r
++		pf._startExplicitLookup(dest) // ordinary caller-requested lookup is allowed
++		r = pf.rumors[dest]
++		r.sendTime = time.Now().Add(-2 * time.Second)
++		pf.rumors[dest] = r
++		pf._retryExplicitLookups()
++		automatic, got = pf.rumors[dest].lookupRetries, counts[dest]
++	})
++	if automatic != 2 || got != 4 {
++		t.Fatalf("automatic=%d all=%d", automatic, got)
++	}
++}
++
++func TestExplicitLookupThrottleFloor(t *testing.T) {
++	t.Log("entry TestExplicitLookupThrottleFloor")
++	defer t.Log("exit TestExplicitLookupThrottleFloor")
++	for _, throttle := range []time.Duration{0, -time.Second, 3 * time.Second} {
++		pc, counts := explicitFixture(t, WithPathThrottle(throttle))
++		var dest publicKey
++		dest[0] = 3
++		var got [3]int
++		phony.Block(&pc.core.router, func() {
++			pf := &pc.core.router.pathfinder
++			pf._startExplicitLookup(dest)
++			for i, age := range []time.Duration{time.Millisecond, max(time.Second, throttle) + time.Second, time.Millisecond} {
++				r := pf.rumors[dest]
++				r.sendTime = time.Now().Add(-age)
++				pf.rumors[dest] = r
++				pf._retryExplicitLookups()
++				got[i] = counts[dest]
++			}
++		})
++		if got != [3]int{1, 2, 2} {
++			t.Fatalf("throttle=%s counts=%v", throttle, got)
++		}
++	}
++}
++
++func TestExplicitLookupTransformedTarget(t *testing.T) {
++	t.Log("entry TestExplicitLookupTransformedTarget")
++	defer t.Log("exit TestExplicitLookupTransformedTarget")
++	pc, counts := explicitFixture(t, WithBloomTransform(func(key ed25519.PublicKey) ed25519.PublicKey {
++		out := make(ed25519.PublicKey, ed25519.PublicKeySize)
++		out[0] = key[0]
++		return out
++	}))
++	var dest publicKey
++	dest[0], dest[1] = 4, 99
++	var correct, incorrect int
++	phony.Block(&pc.core.router, func() {
++		pf := &pc.core.router.pathfinder
++		pf._startExplicitLookup(dest)
++		xform := pf.router.blooms.xKey(dest)
++		r := pf.rumors[xform]
++		r.sendTime = time.Now().Add(-2 * time.Second)
++		pf.rumors[xform] = r
++		pf._retryExplicitLookups()
++		correct, incorrect = counts[dest], counts[xform]
++	})
++	if correct != 2 || incorrect != 0 {
++		t.Fatalf("actual target=%d transformed target=%d", correct, incorrect)
++	}
++}
++
++func TestExplicitLookupSignedNotifyStops(t *testing.T) {
++	t.Log("entry TestExplicitLookupSignedNotifyStops")
++	defer t.Log("exit TestExplicitLookupSignedNotifyStops")
++	pc, counts := explicitFixture(t)
++	pub, key, err := ed25519.GenerateKey(nil)
++	if err != nil {
++		t.Fatal("remote fixture generation failed")
++	}
++	var dest publicKey
++	copy(dest[:], pub)
++	var pendingAfterBad, pendingAfterGood bool
++	var got int
++	phony.Block(&pc.core.router, func() {
++		pf := &pc.core.router.pathfinder
++		pf._startExplicitLookup(dest)
++		notify := pathNotify{source: dest, dest: pc.core.crypto.publicKey, watermark: ^uint64(0), info: pathNotifyInfo{seq: 1}}
++		pf._handleNotify(dest, &notify) // zero signature must not cancel retries
++		pendingAfterBad = pf.rumors[dest].lookupPending
++		notify.info.sign(privateKey(key))
++		pf._handleNotify(dest, &notify)
++		pendingAfterGood = pf.rumors[dest].lookupPending
++		r := pf.rumors[dest]
++		r.sendTime = time.Now().Add(-2 * time.Second)
++		pf.rumors[dest] = r
++		pf._retryExplicitLookups()
++		got = counts[dest]
++	})
++	if !pendingAfterBad || pendingAfterGood || got != 1 {
++		t.Fatalf("badPending=%t goodPending=%t lookups=%d", pendingAfterBad, pendingAfterGood, got)
++	}
++}
++
++func TestExplicitLookupDoesNotExtendExpiry(t *testing.T) {
++	t.Log("entry TestExplicitLookupDoesNotExtendExpiry")
++	defer t.Log("exit TestExplicitLookupDoesNotExtendExpiry")
++	pc, _ := explicitFixture(t, WithPathTimeout(50*time.Millisecond))
++	var dest publicKey
++	dest[0] = 5
++	phony.Block(&pc.core.router, func() {
++		pf := &pc.core.router.pathfinder
++		pf._startExplicitLookup(dest)
++		r := pf.rumors[dest]
++		r.timer.Reset(time.Millisecond)
++		r.sendTime = time.Now().Add(-2 * time.Second)
++		pf.rumors[dest] = r
++		pf._retryExplicitLookups()
++	})
++	deadline := time.Now().Add(time.Second)
++	for {
++		n := 0
++		phony.Block(&pc.core.router, func() { n = len(pc.core.router.pathfinder.rumors) })
++		if n == 0 {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatal("retry extended original rumor expiry")
++		}
++		time.Sleep(time.Millisecond)
++	}
++}
++
++func TestExplicitLookupRemoteCannotAdmit(t *testing.T) {
++	t.Log("entry TestExplicitLookupRemoteCannotAdmit")
++	defer t.Log("exit TestExplicitLookupRemoteCannotAdmit")
++	pc, _ := explicitFixture(t)
++	var dest, source publicKey
++	dest[0], source[0] = 6, 7
++	var n int
++	phony.Block(&pc.core.router, func() {
++		pf := &pc.core.router.pathfinder
++		pf._handleLookup(source, &pathLookup{source: source, dest: dest})
++		pf._handleNotify(source, &pathNotify{source: source, dest: dest})
++		pf._retryExplicitLookups()
++		n = len(pf.rumors)
++	})
++	if n != 0 {
++		t.Fatal("remote input admitted pending state")
++	}
++}
++
++func TestExplicitLookupUnmarkedRumorNotRetried(t *testing.T) {
++	t.Log("entry TestExplicitLookupUnmarkedRumorNotRetried")
++	defer t.Log("exit TestExplicitLookupUnmarkedRumorNotRetried")
++	pc, counts := explicitFixture(t)
++	var dest publicKey
++	dest[0] = 8
++	var got int
++	phony.Block(&pc.core.router, func() {
++		pf := &pc.core.router.pathfinder
++		pf._rumorSendLookup(dest)
++		r := pf.rumors[dest]
++		r.sendTime = time.Now().Add(-2 * time.Second)
++		pf.rumors[dest] = r
++		pf._retryExplicitLookups()
++		got = counts[dest]
++	})
++	if got != 1 {
++		t.Fatal("non-explicit rumor retried")
++	}
++}
+diff --git a/network/packetconn.go b/network/packetconn.go
+index 2eec432..f4fc659 100644
+--- a/network/packetconn.go
++++ b/network/packetconn.go
+@@ -3,6 +3,7 @@ package network
+ import (
+ 	"crypto/ed25519"
+ 	"fmt"
++	"log/slog"
+ 	"net"
+ 	"sync"
+ 	"time"
+@@ -286,9 +287,12 @@ func (d *deadline) getCancel() chan struct{} {
+ }
+ 
+ func (pc *PacketConn) SendLookup(key ed25519.PublicKey) {
++	slog.Debug("entry PacketConn SendLookup")
++	defer slog.Debug("exit PacketConn SendLookup")
+ 	var k publicKey
+ 	copy(k[:], key)
++	slog.Debug("external queue local explicit lookup on router actor")
+ 	pc.core.router.Act(nil, func() {
+-		pc.core.router.pathfinder._rumorSendLookup(k)
++		pc.core.router.pathfinder._startExplicitLookup(k)
+ 	})
+ }
+diff --git a/network/pathfinder.go b/network/pathfinder.go
+index f1af39b..6fd82b2 100644
+--- a/network/pathfinder.go
++++ b/network/pathfinder.go
+@@ -1,6 +1,7 @@
+ package network
+ 
+ import (
++	"log/slog"
+ 	"time"
+ 
+ 	"github.com/Arceliar/ironwood/types"
+@@ -93,12 +94,16 @@ func (pf *pathfinder) handleNotify(p *peer, notify *pathNotify) {
+ }
+ 
+ func (pf *pathfinder) _handleNotify(fromKey publicKey, notify *pathNotify) {
++	slog.Debug("entry pathfinder _handleNotify")
++	defer slog.Debug("exit pathfinder _handleNotify")
+ 	if p := pf.router._lookup(notify.path, &notify.watermark); p != nil {
++		slog.Debug("external forward path notification")
+ 		p.sendPathNotify(pf.router, notify)
+ 		return
+ 	}
+ 	// Check if we should accept this response
+ 	if notify.dest != pf.router.core.crypto.publicKey {
++		slog.Debug("result drop notification wrong destination")
+ 		return
+ 	}
+ 	var info pathInfo
+@@ -106,25 +111,30 @@ func (pf *pathfinder) _handleNotify(fromKey publicKey, notify *pathNotify) {
+ 	// Note that we need to res.check() in every case (as soon as success is otherwise inevitable)
+ 	if info, isIn = pf.paths[notify.source]; isIn {
+ 		if notify.info.seq <= info.seq {
++			slog.Debug("result drop non-new path notification")
+ 			// This isn't newer than the last seq we received, so drop it
+ 			return
+ 		}
+ 		nfo := notify.info
+ 		nfo.path = info.path
+ 		if nfo.equal(notify.info) {
++			slog.Debug("result drop unchanged path notification")
+ 			// This doesn't actually add anything new, so skip it
+ 			return
+ 		}
+ 		if !notify.check() {
++			slog.Debug("error path notification authentication failed")
+ 			return
+ 		}
+ 		info.timer.Reset(pf.router.core.config.pathTimeout)
+ 	} else {
+ 		xform := pf.router.blooms.xKey(notify.source)
+ 		if _, isIn := pf.rumors[xform]; !isIn {
++			slog.Debug("result drop unsolicited path notification")
+ 			return
+ 		}
+ 		if !notify.check() {
++			slog.Debug("error first path notification authentication failed")
+ 			return
+ 		}
+ 		key := notify.source
+@@ -160,6 +170,8 @@ func (pf *pathfinder) _handleNotify(fromKey publicKey, notify *pathNotify) {
+ 		defer pf._handleTraffic(tr)
+ 	}
+ 	pf.paths[notify.source] = info
++	pf._finishExplicitLookup(notify.source)
++	slog.Debug("external path notification callback after accepted signed path")
+ 	pf.router.core.config.pathNotify(notify.source.toEd())
+ }
+ 
+@@ -285,9 +297,13 @@ type pathInfo struct {
+  *************/
+ 
+ type pathRumor struct {
+-	traffic  *traffic
+-	sendTime time.Time   // Time we last sent a rumor (to prevnt spamming)
+-	timer    *time.Timer // time.AfterFunc(cleanup...)
++	traffic       *traffic
++	sendTime      time.Time   // Time we last sent a rumor (to prevnt spamming)
++	timer         *time.Timer // time.AfterFunc(cleanup...)
++	lookupTarget  publicKey   // Only local explicit SendLookup initializes this.
++	lookupStarted bool
++	lookupPending bool
++	lookupRetries uint8
+ }
+ 
+ /**************
+diff --git a/network/router.go b/network/router.go
+index c74f89a..a7f7f1f 100644
+--- a/network/router.go
++++ b/network/router.go
+@@ -3,6 +3,7 @@ package network
+ import (
+ 	crand "crypto/rand"
+ 	"encoding/binary"
++	"log/slog"
+ 	"time"
+ 
+ 	//"fmt"
+@@ -92,7 +93,10 @@ func (r *router) init(c *core) {
+ }
+ 
+ func (r *router) _doMaintenance() {
++	slog.Debug("entry router _doMaintenance")
++	defer slog.Debug("exit router _doMaintenance")
+ 	if r.mainTimer == nil {
++		slog.Debug("result router maintenance stopped")
+ 		return
+ 	}
+ 	r.doRoot2 = r.doRoot2 || r.doRoot1
+@@ -101,6 +105,8 @@ func (r *router) _doMaintenance() {
+ 	r._fix()           // Selects new parent, if needed
+ 	r._sendAnnounces() // Sends announcements to peers, if needed
+ 	r.blooms._doMaintenance()
++	slog.Debug("external maintenance bounded explicit lookup retry")
++	r.pathfinder._retryExplicitLookups()
+ 	r.mainTimer.Reset(time.Second)
+ }
+ 
